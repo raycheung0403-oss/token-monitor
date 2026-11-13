@@ -241,6 +241,7 @@ const {
 } = require('./renderer/viewDisplayPreferences');
 const {
   defaultHomeModulePreferences,
+  migrateHomeLimitDisplayMode,
   normalizeHiddenHomeModules,
   normalizeHomeLimitDisplayMode,
   normalizeHomeModuleCounts,
@@ -597,6 +598,9 @@ let initialLimitProvidersPending = false;
 // settings are written through saveSettings() after the window exists, so the flag
 // carries the decision from the read to that first save.
 let seededClientSplitsPending = false;
+// Set by readSettings() when the one-time reset of the Home limits layout to
+// `default` changed a saved value; saved at the same point as a client split.
+let homeLimitDisplayModePending = false;
 let persistedSettingsSnapshot = null;
 let credentialStore = null;
 let credentialStorageErrorShown = false;
@@ -762,7 +766,9 @@ function defaultSettings() {
     hiddenHomeModules: defaultHomeModulePreferences().hiddenHomeModules,
     homeModuleCounts: normalizeHomeModuleCounts(),
     showHomeLimitBars: false,
-    homeLimitDisplayMode: 'text',
+    homeVendorColors: false,
+    homeLimitDisplayMode: 'default',
+    homeLimitDisplayModeDefaulted: true,
     showHomeLimitProviderNames: false,
     projectsEnabled: parseBoolean(process.env.TOKEN_MONITOR_PROJECTS_ENABLED, true),
     projectBreakdownMode: 'tool',
@@ -2353,12 +2359,13 @@ function ensureSettingsLoaded() {
       settings.codexManagedAccounts = hydratedCodexAccounts;
     }
   }
-  // A seeded client identity split is an in-memory addition at this point.
-  // Persist it with the same retry-on-next-save tolerance as the migration
-  // above, so a read-only or failing settings file delays the write instead of
-  // losing the tracked client.
-  if (seededClientSplitsPending) {
+  // A seeded client identity split and the one-time Home limits layout reset are
+  // in-memory changes at this point. Persist them with the same
+  // retry-on-next-save tolerance as the migration above, so a read-only or
+  // failing settings file delays the write instead of losing the change.
+  if (seededClientSplitsPending || homeLimitDisplayModePending) {
     seededClientSplitsPending = false;
+    homeLimitDisplayModePending = false;
     saveSettings();
   }
   rendererViewState = normalizeInitialRendererViewState(settings.lastViewState, rendererViewState);
@@ -2806,8 +2813,12 @@ function readSettings() {
       merged.hiddenHomeModules = normalizeHiddenHomeModules(saved.hiddenHomeModules, DEFAULT_HOME_MODULE_LIST);
     }
     merged.showHomeLimitBars = parseBoolean(merged.showHomeLimitBars, false);
+    merged.homeVendorColors = parseBoolean(merged.homeVendorColors, false);
     merged.homeModuleCounts = normalizeHomeModuleCounts(merged.homeModuleCounts);
-    merged.homeLimitDisplayMode = normalizeHomeLimitDisplayMode(merged.homeLimitDisplayMode);
+    const homeLimitDisplay = migrateHomeLimitDisplayMode(saved.homeLimitDisplayMode, saved.homeLimitDisplayModeDefaulted);
+    merged.homeLimitDisplayMode = homeLimitDisplay.mode;
+    merged.homeLimitDisplayModeDefaulted = true;
+    homeLimitDisplayModePending = homeLimitDisplay.changed;
     merged.showHomeLimitProviderNames = parseBoolean(merged.showHomeLimitProviderNames, false);
     merged.claudeCliFallbackEnabled = parseBoolean(merged.claudeCliFallbackEnabled, true);
     merged.codexResetForecastEnabled = parseBoolean(merged.codexResetForecastEnabled, false);
@@ -8625,6 +8636,7 @@ app.whenReady().then(() => {
       hiddenHomeModules: patch.hiddenHomeModules !== undefined ? normalizeHiddenHomeModules(patch.hiddenHomeModules, DEFAULT_HOME_MODULE_LIST) : normalizeHiddenHomeModules(settings.hiddenHomeModules, DEFAULT_HOME_MODULE_LIST),
       homeModuleCounts: normalizeHomeModuleCounts(patch.homeModuleCounts, settings.homeModuleCounts),
       showHomeLimitBars: parseBoolean(patch.showHomeLimitBars ?? settings.showHomeLimitBars, false),
+      homeVendorColors: parseBoolean(patch.homeVendorColors ?? settings.homeVendorColors, false),
       homeLimitDisplayMode: normalizeHomeLimitDisplayMode(patch.homeLimitDisplayMode ?? settings.homeLimitDisplayMode),
       showHomeLimitProviderNames: parseBoolean(patch.showHomeLimitProviderNames ?? settings.showHomeLimitProviderNames, false),
       homeLimitProviderOrder: patch.homeLimitProviderOrder !== undefined ? migrateHomeLimitProviderOrder(patch.homeLimitProviderOrder) : (settings.homeLimitProviderOrder || ''),
