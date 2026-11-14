@@ -432,6 +432,7 @@ const {
   createStatsPublicationBatcher,
   rendererStats
 } = require('./statsPublisher');
+const { rendererNeedsStatsWhileHidden } = require('./statsPushPolicy');
 const { withoutSessionTitleStats, withoutSessionTitles } = require('./sessionTitleDisplay');
 const { createSseBlockReader, parseSseBlock } = require('./sseEventReader');
 const { createSyncUploadScheduler, normalizeSyncUploadIntervalMs } = require('./syncUploadScheduler');
@@ -2406,9 +2407,45 @@ function syncPluginWindowVisibility(win) {
   sendMainWindowVisibility(win);
 }
 
+let mainWindowVisibilitySyncedAt = 0;
+let mainWindowShowSyncTimer = null;
+
+function scheduleMainWindowShowSync(scheduledAt = Date.now()) {
+  if (mainWindowShowSyncTimer) clearTimeout(mainWindowShowSyncTimer);
+  mainWindowShowSyncTimer = setTimeout(() => {
+    mainWindowShowSyncTimer = null;
+    if (quitRequested || !mainWindow || mainWindow.isDestroyed()) return;
+    // The native show event already delivered the current snapshot.
+    if (mainWindowVisibilitySyncedAt >= scheduledAt) return;
+    if (!mainWindow.isVisible() || mainWindow.isMinimized()) return;
+    sendMainWindowVisibility(mainWindow);
+  }, 100);
+  mainWindowShowSyncTimer.unref?.();
+}
+
 function sendMainWindowVisibility(win = mainWindow) {
   if (!win || win !== mainWindow || win.isDestroyed() || win.webContents.isDestroyed()) return;
-  win.webContents.send('window:visibility', win.isVisible() && !win.isMinimized());
+  const visible = win.isVisible() && !win.isMinimized();
+  if (visible) mainWindowVisibilitySyncedAt = Date.now();
+  if (visible) {
+    // A hidden window may have skipped full pushes; hand it the current
+    // snapshot before the visibility event so its first visible frame is fresh.
+    sendStatsPresentationToRenderer();
+  } else {
+    // macOS can emit 'show' before isVisible() flips, which would leave the
+    // renderer believing it is still hidden. Recheck on the next turn: a window
+    // that really revealed gets the current snapshot and a true visibility
+    // event; one that is still hidden or was hidden again does nothing.
+    const timer = setTimeout(() => {
+      if (quitRequested || win.isDestroyed() || win.webContents.isDestroyed()) return;
+      if (!win.isVisible() || win.isMinimized()) return;
+      // Re-enter so the sync timestamp is recorded and the show-path helper
+      // does not send the same snapshot again.
+      sendMainWindowVisibility(win);
+    }, 50);
+    timer.unref?.();
+  }
+  win.webContents.send('window:visibility', visible);
 }
 
 // Every local page shares one renderer process, but a split process or a
@@ -5265,8 +5302,20 @@ function publishLocalSessionActivity(patch) {
 // push that lands mid-load is already covered by the refreshStats() the renderer
 // runs on init, so deferring every one of them would only queue a listener per
 // frame against a slow load and then replay a burst of superseded stats.
+function mainWindowStatsPushWanted() {
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  if (mainWindow.isVisible() && !mainWindow.isMinimized()) return true;
+  return rendererNeedsStatsWhileHidden({
+    trayContent: settings?.trayContent,
+    showTrayIcon: settings?.showTrayIcon !== false,
+    floatingBubbleEnabled: settings?.floatingBubbleEnabled === true,
+    floatingBubbleCollapsed: floatingBubbleState.collapsed === true
+  });
+}
+
 function sendPush(payload, options = {}) {
   const previousHistoryRevision = statsHistoryRevision(latestStats);
+  const wantsRenderer = options.deferToRenderer === true || mainWindowStatsPushWanted();
   let rendererPayload = payload;
   if (payload?.data?.stats) {
     payload.data.stats = injectLocalDeviceStatus(payload.data.stats);
@@ -5283,10 +5332,12 @@ function sendPush(payload, options = {}) {
     getLimitsHistoryStore().record(currentHubStatsIdentity(), visibleStats.limits);
     limitsHistoryController?.refresh();
     migrateCodexAdditionalLimits(visibleStats);
-    rendererPayload = {
-      ...payload,
-      data: { ...payload.data, stats: rendererSnapshots.stamp(latestStats, rendererStats(visibleStats)) }
-    };
+    if (wantsRenderer) {
+      rendererPayload = {
+        ...payload,
+        data: { ...payload.data, stats: rendererSnapshots.stamp(latestStats, rendererStats(visibleStats)) }
+      };
+    }
     scheduleMacWidgetSnapshot(visibleStats, options.widgetProducerOwner);
     pluginRuntime?.publishStats(visibleStats, latestStats);
     updateEdgeDockCells(visibleStats);
@@ -5305,7 +5356,11 @@ function sendPush(payload, options = {}) {
     const deferred = payload?.data?.stats;
     sendMainWindowEvent('stats:push', rendererPayload, () => !deferred || latestStats === deferred);
   } else if (mainWindow && !mainWindow.isDestroyed()) {
-    try { mainWindow.webContents.send('stats:push', rendererPayload); } catch (_) {}
+    // Status and activity patches stay small and keep the hidden window's
+    // connection/activity state current. A full snapshot is the expensive one.
+    if (!payload?.data?.stats || wantsRenderer) {
+      try { mainWindow.webContents.send('stats:push', rendererPayload); } catch (_) {}
+    }
   }
   if (payload?.data?.stats) {
     const nextHistoryRevision = statsHistoryRevision(payload.data.stats);
@@ -5719,7 +5774,9 @@ function showPopover(clickPoint = null) {
   const target = popoverBounds(tray, current.width, current.height, { clickPoint });
   mainWindow.setBounds(target);
   suppressNextBlurHide = true;
+  const showSyncAt = Date.now();
   mainWindow.show();
+  scheduleMainWindowShowSync(showSyncAt);
   // The focus event itself may not fire a blur; the suppress flag covers the
   // case where macOS fires blur immediately after show because the click that
   // opened us still has the menu bar as the focused element.
@@ -5757,7 +5814,9 @@ function focusExistingWindow() {
     applyMacSpaceBehavior(false);
     if (floatingBubbleState.collapsed) expandFloatingBubble();
     else {
+      const showSyncAt = Date.now();
       mainWindow.show();
+      scheduleMainWindowShowSync(showSyncAt);
       restoreWindowMaximized(mainWindow, settings);
     }
   }
@@ -6619,6 +6678,20 @@ function syncDockSurfaces(rendererSettings) {
   syncPluginQuotaSurfaceDemand();
 }
 
+function sendStatsPresentationToRenderer() {
+  if (!latestStats || !mainWindow || mainWindow.isDestroyed() || !mainWindowStatsPushWanted()) return false;
+  const visibleStats = electronPresentationStats(latestStats);
+  try {
+    mainWindow.webContents.send('stats:push', {
+      event: 'stats',
+      data: { type: 'stats', reason: 'presentation', mode, stats: rendererSnapshots.stamp(latestStats, rendererStats(visibleStats)) }
+    });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 function refreshLimitStatsPresentation() {
   if (!latestStats) return;
   const visibleStats = electronPresentationStats(latestStats);
@@ -6626,14 +6699,7 @@ function refreshLimitStatsPresentation() {
   scheduleMacWidgetSnapshot(visibleStats, captureMacWidgetProducerOwner());
   repaintDockSurfaces();
   updateTrayDisplay();
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    try {
-      mainWindow.webContents.send('stats:push', {
-        event: 'stats',
-        data: { type: 'stats', reason: 'presentation', mode, stats: rendererSnapshots.stamp(latestStats, rendererStats(visibleStats)) }
-      });
-    } catch (_) {}
-  }
+  sendStatsPresentationToRenderer();
 }
 
 function sendMimoAccountsPush() {
@@ -7861,7 +7927,9 @@ function isAllowedExternalUrl(value) {
 
 function revealWindow(target = mainWindow, options = {}) {
   const inactive = options.inactive === true || (target === mainWindow && floatingBubbleState.collapsed);
+  const showSyncAt = Date.now();
   showWindow(target, inactive);
+  if (target === mainWindow) scheduleMainWindowShowSync(showSyncAt);
 }
 
 function loadWindowFile(target, options = {}) {
