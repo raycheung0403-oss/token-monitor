@@ -1874,20 +1874,6 @@ const SESSION_IDENTITY_VERSION = 2;
 // was already broken.
 const WATCH_MAX_WAIT_MS = 5000;
 
-// Escape hatch for filesystems that never deliver native events — network
-// mounts, some FUSE drivers, container bind mounts. chokidar has its own
-// CHOKIDAR_USEPOLLING override, but that is chokidar's surface, not ours: it
-// is undocumented for our users and can change with a dependency bump, so
-// support asks would have no stable answer. Resolved here rather than in each
-// entry point so the widget and the headless agent cannot drift apart.
-// Tri-state on purpose: unset must fall through to the caller's value, which
-// is why parseBoolean's fallback semantics don't fit. The default is native on
-// every platform — chokidar 4 has no per-platform backend left to differ on,
-// and the failure cases it cannot cover are handled by the watch-descriptor
-// fallback below rather than by pre-emptively polling everywhere.
-//
-// Returns undefined when unset, which is what keeps that tri-state readable to
-// callers that need to tell "no opinion" from an explicit "never poll".
 function startCollector(options) {
   const {
     clients, allTimeSince, commandTimeoutMs, deviceId, agentVersion, agentRuntime,
