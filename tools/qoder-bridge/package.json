@@ -1,0 +1,15 @@
+{
+  "name": "qoder-token-monitor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Qoder live token usage bridge for Token Monitor",
+  "type": "commonjs",
+  "scripts": {
+    "install-bridge": "node src/install.js",
+    "uninstall-bridge": "node src/uninstall.js",
+    "test": "node test/estimate.test.js && node test/usage.test.js && node test/catalog.test.js"
+  },
+  "devDependencies": {
+    "@electron/asar": "^4.3.1"
+  }
+}
